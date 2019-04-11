@@ -1,0 +1,143 @@
+pipeline {
+    agent { node { label 'terraform && apply' } }
+    environment {
+        SERVICE_NAME = "Maintenance"
+        AWS_ACCOUNT = sh (script:"aws sts get-caller-identity --query Account --output text", returnStdout: true).trim()
+        AWS_REGION = sh (script:"curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone | sed -e 's/[a-z]\$//g'", returnStdout: true).trim()
+        TERRAFORM_PATH = tool(name: 'terraform', type: 'org.jenkinsci.plugins.terraform.TerraformInstallation')
+        PATH = "${TERRAFORM_PATH}:$PATH"
+        PRODUCT_NAME = SERVICE_NAME.toLowerCase()
+        LAMBDA_ZIP_FILE = "container_deploy_fail_notification.zip"
+        tainted = false
+    }
+
+    options {
+        ansiColor('xterm')
+    }
+
+    stages {
+        stage('checkout'){
+            steps {
+	              checkout scm
+            }
+        }
+
+        stage('Initialize'){
+            steps {
+                script {
+                    configs = readJSON file: "./jenkins/config.json"
+                    config = configs.config."${AWS_ACCOUNT}"
+                    aws_network_type = config.aws_network_type
+                    state_bucket = config.state_bucket
+                    environment = config.environment
+                    sh "terraform -v"
+                    if (fileExists(".terraform/terraform.tfstate")) {
+                        sh "rm -rf .terraform/*"
+                    }
+                    if (fileExists("status")) {
+                        sh "rm status"
+                    }
+                    sh "./generate_backend.sh -b ${state_bucket} -a ${PRODUCT_NAME}/${aws_network_type} -r ${AWS_REGION} -s ${environment} > terraform.tf"
+                    sh "terraform init"
+                }
+                script {
+                    if( fileExists("${LAMBDA_ZIP_FILE}") ) {
+                        sh "rm ${LAMBDA_ZIP_FILE}"
+                    }
+                    zip zipFile: "${LAMBDA_ZIP_FILE}", dir: "function", archive: true
+                }
+            }
+        }
+
+        stage('Taint'){
+            when {
+                expression { environment == "staging" }
+            }
+            steps {
+                script {
+                    try {
+                        taint_list = params.taint_target.trim().split("\n")
+                        taint_list.each { item ->
+                            if ( item.isEmpty() != true ) {
+                                sh(script: "terraform taint ${item}")
+                                tainted = true
+                            }
+                        }
+                    } catch (err) {
+                        echo "no taint target"
+                    }
+                }
+            }
+        }
+
+        stage('Plan'){
+            steps {
+                script {
+                    sh "set +e; terraform plan -var-file=./config/account/${aws_network_type}/${environment}/${AWS_REGION}.tfvars -out=plan.out -detailed-exitcode; echo \$? > status"
+                    apply = false
+                    sync = false
+                    def exitCode = readFile('status').trim()
+                    echo "Terraform Plan Exit Code: ${exitCode}"
+                    if (exitCode == "0") {
+                        currentBuild.result = 'SUCCESS'
+                    }
+                    if (exitCode == "1") {
+                        currentBuild.result = 'FAILURE'
+                    }
+                    if (exitCode == "2") {
+                        stash name: "plan", includes: "plan.out"
+                        build job: 'slack_build_notify', parameters: [string(name: 'build_status', value: "SUCCESS"), string(name: 'message', value: "[${AWS_REGION}] ${SERVICE_NAME} for ${aws_network_type} waiting for Infra deployment. (#${env.BUILD_NUMBER}).\n${env.BUILD_URL}")]
+                        try {
+                            input message: 'Apply Plan?', ok: 'Apply'
+                            apply = true
+                        } catch (err) {
+                            build job: 'slack_build_notify', parameters: [string(name: 'build_status', value: "FAILED"), string(name: 'message', value: "[${AWS_REGION}] ${SERVICE_NAME} for ${aws_network_type} Infra deployment discarded.(#${env.BUILD_NUMBER})")]
+                            apply = false
+                            sync = false
+                            currentBuild.result = 'UNSTABLE'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Untaint') {
+            when {
+                expression { return ( apply == false && tainted == true ) }
+            }
+            steps {
+                script {
+                    taint_list = params.taint_target.trim().split("\n")
+                    taint_list.each { item ->
+                        if ( item.isEmpty() != true ) {
+                            sh(script: "terraform untaint ${item}")
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Apply')  {
+            when {
+                expression { return apply }
+            }
+            steps {
+                script {
+                    unstash 'plan'
+                    if (fileExists("status.apply")) {
+                        sh "rm status.apply"
+                    }
+                    ansiColor('xterm') {
+                        sh 'set +e; terraform apply plan.out; echo \$? &> status.apply'
+                    }
+                    def applyExitCode = readFile('status.apply').trim()
+                    if (applyExitCode == "0") {
+                        build job: 'slack_build_notify', parameters: [string(name: 'build_status', value: "SUCCESS"), string(name: 'message', value: "[${AWS_REGION}] ${SERVICE_NAME} for ${aws_network_type} Infra deployment (#${env.BUILD_NUMBER}) has been deployed.")]
+                    } else {
+                        build job: 'slack_build_notify', parameters: [string(name: 'build_status', value: "FAILED"), string(name: 'message', value: "[${AWS_REGION}] ${SERVICE_NAME} for ${aws_network_type} Infra deployment (#${env.BUILD_NUMBER}) has failed.\n${env.BUILD_URL}")]
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,28 @@
+{
+    "config":{
+        "hogehoge":{
+            "aws_network_type":"default",
+            "environment":"production",
+            "state_bucket":"hogehoge",
+            "resource_bucket":"hogefuga"
+        },
+        "fugafuga":{
+            "aws_network_type":"default",
+            "environment":"staging",
+            "state_bucket":"fugafuga",
+            "resource_bucket":"hogefuga"
+        },
+        "hogefuga":{
+            "aws_network_type":"front",
+            "environment":"production",
+            "state_bucket":"hogehoge",
+            "resource_bucket":"hogefuga"
+        },
+        "fugahoge":{
+            "aws_network_type":"front",
+            "environment":"staging",
+            "state_bucket":"fugafuga",
+            "resource_bucket":"hogefuga"
+        }
+    }
+}

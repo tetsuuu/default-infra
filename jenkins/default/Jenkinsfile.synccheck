@@ -1,0 +1,38 @@
+pipeline {
+    agent any
+    environment {
+        AWS_NETWORK_TYPE = "microservice"
+        SERVICE_NAME = "Maintenance"
+        AWS_REGION = sh (script:"curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone | sed -e 's/[a-z]\$//g'", returnStdout: true).trim()
+        STAGE = "${params.environment}"
+        STATE_S3_BUCKET = "${params.state_s3_bucket}"
+        RESOURCE_S3_BUCKET = "${params.resource_s3_bucket}"
+        TERRAFORM_PATH = tool(name: 'terraform', type: 'org.jenkinsci.plugins.terraform.TerraformInstallation')
+        PATH = "${TERRAFORM_PATH}:$PATH"
+        RESOURCE_BASEPATH_KEY  = "terraform/resource"
+        PRODUCT_NAME = SERVICE_NAME.toLowerCase()
+        tainted = false
+    }
+
+    options {
+        ansiColor('xterm')
+    }
+
+    stages {
+        stage('checkout'){
+            steps {
+	              checkout scm
+            }
+        }
+
+        stage('Sync Check'){
+            steps {
+                script {
+                    command = "set +e; aws s3 sync s3 s3://${RESOURCE_S3_BUCKET}/${RESOURCE_BASEPATH_KEY}/${PRODUCT_NAME} --exclude \"*bastion-log/*/*\" --exclude \"*bastion-secure-log/*/*\" --exclude \"*fluentd/*/*\" --exclude \"*nagios-v2/*/*\" --include \"*nagios-v2/conf.d/*\" --include \"*nagios-v2/objects/*\" --dryrun --delete;"
+                    result = sh returnStdout: true, script: command
+                    print result
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,63 @@
+pipeline {
+    agent any
+    environment {
+        SERVICE_NAME = "Maintenance"
+        AWS_ACCOUNT = sh (script:"aws sts get-caller-identity --query Account --output text", returnStdout: true).trim()
+        AWS_REGION = sh (script:"curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone | sed -e 's/[a-z]\$//g'", returnStdout: true).trim()
+        TERRAFORM_PATH = tool(name: 'terraform', type: 'org.jenkinsci.plugins.terraform.TerraformInstallation')
+        PATH = "${TERRAFORM_PATH}:$PATH"
+        PRODUCT_NAME = SERVICE_NAME.toLowerCase()
+        LAMBDA_ZIP_FILE = "container_deploy_fail_notification.zip"
+    }
+
+    options {
+        ansiColor('xterm')
+    }
+
+    stages {
+        stage('Initialize'){
+            steps {
+                script {
+                    configs = readJSON file: "./jenkins/config.json"
+                    config = configs.config."${AWS_ACCOUNT}"
+                    aws_network_type = config.aws_network_type
+                    state_bucket = config.state_bucket
+                    environment = config.environment
+                    sh "terraform -v"
+                    if (fileExists(".terraform/terraform.tfstate")) {
+                        sh "rm -rf .terraform/terraform.tfstate"
+                    }
+                    if (fileExists("status")) {
+                        sh "rm status"
+                    }
+                    sh "./generate_backend.sh -b ${state_bucket} -a ${PRODUCT_NAME}/${aws_network_type} -r ${AWS_REGION} -s ${environment} > terraform.tf"
+                    sh "terraform init"
+                }
+                script {
+                    if( fileExists("${LAMBDA_ZIP_FILE}") ) {
+                        sh "rm ${LAMBDA_ZIP_FILE}"
+                    }
+                    zip zipFile: "${LAMBDA_ZIP_FILE}", dir: "function", archive: true
+                }
+            }
+        }
+
+        stage('Plan'){
+            steps {
+                script {
+                    sh "set +e; terraform plan -var-file=./config/account/${aws_network_type}/${environment}/${AWS_REGION}.tfvars -out=plan.out -detailed-exitcode; echo \$? > status"
+                    apply = false
+                    sync = false
+                    def exitCode = readFile('status').trim()
+                    echo "Terraform Plan Exit Code: ${exitCode}"
+                    if (exitCode == "0") {
+                        currentBuild.result = 'SUCCESS'
+                    }
+                    if (exitCode == "1") {
+                        currentBuild.result = 'FAILURE'
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,133 @@
+pipeline {
+    agent { node { label 'jenkins-slave-apply' } }
+    environment {
+        AWS_NETWORK_TYPE = "default"
+        SERVICE_NAME = "Maintenance"
+        AWS_REGION = sh (script:"curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone | sed -e 's/[a-z]\$//g'", returnStdout: true).trim()
+        STAGE = "${params.environment}"
+        STATE_S3_BUCKET = "${params.state_s3_bucket}"
+        TERRAFORM_PATH = tool(name: 'terraform', type: 'org.jenkinsci.plugins.terraform.TerraformInstallation')
+        PATH = "${TERRAFORM_PATH}:$PATH"
+        PRODUCT_NAME = SERVICE_NAME.toLowerCase()
+        tainted = false
+    }
+
+    options {
+        ansiColor('xterm')
+    }
+
+    stages {
+        stage('checkout'){
+            steps {
+	              checkout scm
+            }
+        }
+
+        stage('Initialize'){
+            steps {
+                script {
+                    sh "terraform -v"
+                    if (fileExists(".terraform/terraform.tfstate")) {
+                        sh "rm -rf .terraform/*"
+                    }
+                    if (fileExists("status")) {
+                        sh "rm status"
+                    }
+                    sh "./generate_backend.sh -b ${STATE_S3_BUCKET} -a ${PRODUCT_NAME}/${AWS_NETWORK_TYPE} -r ${AWS_REGION} -s ${STAGE} > terraform.tf"
+                    sh "terraform init"
+                }
+            }
+        }
+
+        stage('Taint'){
+            when {
+                expression { STAGE == "staging" }
+            }
+            steps {
+                script {
+                    try {
+                        taint_list = params.taint_target.trim().split("\n")
+                        taint_list.each { item ->
+                            if ( item.isEmpty() != true ) {
+                                sh(script: "terraform taint ${item}")
+                                tainted = true
+                            }
+                        }
+                    } catch (err) {
+                        echo "no taint target"
+                    }
+                }
+            }
+        }
+
+        stage('Plan'){
+            steps {
+                script {
+                    sh "set +e; terraform plan -var-file=./config/account/${AWS_NETWORK_TYPE}/${STAGE}/${AWS_REGION}.tfvars -out=plan.out -detailed-exitcode; echo \$? > status"
+                    apply = false
+                    sync = false
+                    def exitCode = readFile('status').trim()
+                    echo "Terraform Plan Exit Code: ${exitCode}"
+                    if (exitCode == "0") {
+                        currentBuild.result = 'SUCCESS'
+                    }
+                    if (exitCode == "1") {
+                        currentBuild.result = 'FAILURE'
+                    }
+                    if (exitCode == "2") {
+                        stash name: "plan", includes: "plan.out"
+                        build job: 'slack_build_notify', parameters: [string(name: 'build_status', value: "SUCCESS"), string(name: 'message', value: "[${AWS_REGION}] ${SERVICE_NAME} waiting for Infra deployment. (#${env.BUILD_NUMBER}).\n${env.BUILD_URL}")]
+                        try {
+                            input message: 'Apply Plan?', ok: 'Apply'
+                            apply = true
+                        } catch (err) {
+                            build job: 'slack_build_notify', parameters: [string(name: 'build_status', value: "FAILED"), string(name: 'message', value: "[${AWS_REGION}] ${SERVICE_NAME} Infra deployment discarded.(#${env.BUILD_NUMBER})")]
+                            apply = false
+                            sync = false
+                            currentBuild.result = 'UNSTABLE'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Untaint') {
+            when {
+                expression { return ( apply == false && tainted == true ) }
+            }
+            steps {
+                script {
+                    taint_list = params.taint_target.trim().split("\n")
+                    taint_list.each { item ->
+                        if ( item.isEmpty() != true ) {
+                            sh(script: "terraform untaint ${item}")
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Apply')  {
+            when {
+                expression { return apply }
+            }
+            steps {
+                script {
+                    unstash 'plan'
+                    if (fileExists("status.apply")) {
+                        sh "rm status.apply"
+                    }
+                    ansiColor('xterm') {
+                        sh 'set +e; terraform apply plan.out; echo \$? &> status.apply'
+                    }
+                    def applyExitCode = readFile('status.apply').trim()
+                    if (applyExitCode == "0") {
+                        build job: 'slack_build_notify', parameters: [string(name: 'build_status', value: "SUCCESS"), string(name: 'message', value: "[${AWS_REGION}] ${SERVICE_NAME} Infra deployment (#${env.BUILD_NUMBER}) has been deployed.")]
+                    } else {
+                        build job: 'slack_build_notify', parameters: [string(name: 'build_status', value: "FAILED"), string(name: 'message', value: "[${AWS_REGION}] ${SERVICE_NAME} Infra deployment (#${env.BUILD_NUMBER}) has failed.\n${env.BUILD_URL}")]
+                    }
+                }
+            }
+        }
+    }
+}
